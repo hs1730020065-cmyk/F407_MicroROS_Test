@@ -59,12 +59,26 @@ typedef StaticTask_t osStaticThreadDef_t;
 #define BASE_FOOTPRINT_FRAME_ID       "base_footprint"
 #define ODOM_TIMER_PERIOD_MS          50U
 #define ODOM_LINEAR_X_MPS             0.1
+#define PING_TIMER_PERIOD_MS          1000U
+#define RCL_RETRY_DELAY_MS            500U
+#define APP_ERROR_DELAY_MS            1000U
+#define EXECUTOR_SPIN_TIMEOUT_MS      10U
+#define EXECUTOR_LOOP_DELAY_MS        10U
+#define APP_MILLISECONDS_PER_SECOND   1000.0
 #define APP_NANOSECONDS_PER_SECOND    1000000000LL
 
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+#define RCL_RETRY_UNTIL_OK(call)          \
+  do                                      \
+  {                                       \
+    while ((call) != RCL_RET_OK)          \
+    {                                     \
+      retry_after_rcl_error();            \
+    }                                     \
+  } while (0)
 
 /* USER CODE END PM */
 
@@ -118,6 +132,9 @@ void * microros_zero_allocate(size_t number_of_elements, size_t size_of_element,
 static bool init_odom_tf_messages(void);
 static builtin_interfaces__msg__Time get_micro_ros_time(void);
 static void odom_timer_callback(rcl_timer_t * timer, int64_t last_call_time);
+static void stop_task_forever(void);
+static void retry_after_rcl_error(void);
+static bool publish_message(rcl_publisher_t * publisher, const void * message);
 
 /* USER CODE END FunctionPrototypes */
 
@@ -178,7 +195,6 @@ void StartDefaultTask(void *argument)
 
   (void) argument;
 
-
   rmw_uros_set_custom_transport(
       true,
       (void *) &huart1,
@@ -196,10 +212,7 @@ void StartDefaultTask(void *argument)
 
   if (!rcutils_set_default_allocator(&freeRTOS_allocator))
   {
-    for (;;)
-    {
-      osDelay(1000);
-    }
+    stop_task_forever();
   }
 
   rcl_allocator_t allocator = rcl_get_default_allocator();
@@ -210,81 +223,45 @@ void StartDefaultTask(void *argument)
   static rclc_executor_t executor;
   static std_msgs__msg__Int32 msg;
 
-  while (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK)
-  {
-    rcl_reset_error();
-    osDelay(500);
-  }
+  RCL_RETRY_UNTIL_OK(rclc_support_init(&support, 0, NULL, &allocator));
+  RCL_RETRY_UNTIL_OK(rclc_node_init_default(&node, "stm32_f407_node", "", &support));
 
-  while (rclc_node_init_default(&node, "stm32_f407_node", "", &support) != RCL_RET_OK)
-  {
-    rcl_reset_error();
-    osDelay(500);
-  }
-
-  while (rclc_publisher_init_default(
+  RCL_RETRY_UNTIL_OK(rclc_publisher_init_default(
       &publisher,
       &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32),
-      "/stm32_ping") != RCL_RET_OK)
-  {
-    rcl_reset_error();
-    osDelay(500);
-  }
+      "/stm32_ping"));
 
-  while (rclc_publisher_init_default(
+  RCL_RETRY_UNTIL_OK(rclc_publisher_init_default(
       &odom_publisher,
       &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
-      "/odom") != RCL_RET_OK)
-  {
-    rcl_reset_error();
-    osDelay(500);
-  }
+      "/odom"));
 
-  while (rclc_publisher_init_default(
+  RCL_RETRY_UNTIL_OK(rclc_publisher_init_default(
       &tf_publisher,
       &node,
       ROSIDL_GET_MSG_TYPE_SUPPORT(tf2_msgs, msg, TFMessage),
-      "/tf") != RCL_RET_OK)
-  {
-    rcl_reset_error();
-    osDelay(500);
-  }
+      "/tf"));
 
   if (!init_odom_tf_messages())
   {
-    for (;;)
-    {
-      osDelay(1000);
-    }
+    stop_task_forever();
   }
 
   (void) rmw_uros_sync_session(1000);
 
-  while (rclc_timer_init_default(
+  RCL_RETRY_UNTIL_OK(rclc_timer_init_default(
       &odom_timer,
       &support,
       RCL_MS_TO_NS(ODOM_TIMER_PERIOD_MS),
-      odom_timer_callback) != RCL_RET_OK)
-  {
-    rcl_reset_error();
-    osDelay(500);
-  }
+      odom_timer_callback));
 
-  while (rclc_executor_init(&executor, &support.context, 1, &allocator) != RCL_RET_OK)
-  {
-    rcl_reset_error();
-    osDelay(500);
-  }
+  RCL_RETRY_UNTIL_OK(rclc_executor_init(&executor, &support.context, 1, &allocator));
 
   msg.data = 0;
 
-  while (rclc_executor_add_timer(&executor, &odom_timer) != RCL_RET_OK)
-  {
-    rcl_reset_error();
-    osDelay(500);
-  }
+  RCL_RETRY_UNTIL_OK(rclc_executor_add_timer(&executor, &odom_timer));
 
   uint32_t last_publish = osKernelGetTickCount();
 
@@ -292,28 +269,24 @@ void StartDefaultTask(void *argument)
   {
     uint32_t now = osKernelGetTickCount();
 
-    if ((now - last_publish) >= pdMS_TO_TICKS(1000))
+    if ((now - last_publish) >= pdMS_TO_TICKS(PING_TIMER_PERIOD_MS))
     {
       last_publish = now;
 
-      if (rcl_publish(&publisher, &msg, NULL) == RCL_RET_OK)
+      if (publish_message(&publisher, &msg))
       {
         msg.data++;
       }
-      else
-      {
-        rcl_reset_error();
-      }
     }
 
-    rcl_ret_t spin_ret = rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+    rcl_ret_t spin_ret = rclc_executor_spin_some(&executor, RCL_MS_TO_NS(EXECUTOR_SPIN_TIMEOUT_MS));
 
     if ((spin_ret != RCL_RET_OK) && (spin_ret != RCL_RET_TIMEOUT))
     {
       rcl_reset_error();
     }
 
-    osDelay(10);
+    osDelay(EXECUTOR_LOOP_DELAY_MS);
   }
 
   /* USER CODE END StartDefaultTask */
@@ -352,8 +325,17 @@ static bool init_odom_tf_messages(void)
 
   odom_msg.pose.pose.orientation.w = 1.0;
   odom_msg.twist.twist.linear.x = ODOM_LINEAR_X_MPS;
+  odom_msg.twist.twist.linear.y = 0.0;
+  odom_msg.twist.twist.linear.z = 0.0;
+  odom_msg.twist.twist.angular.x = 0.0;
+  odom_msg.twist.twist.angular.y = 0.0;
   odom_msg.twist.twist.angular.z = 0.0;
 
+  tf->transform.translation.y = 0.0;
+  tf->transform.translation.z = 0.0;
+  tf->transform.rotation.x = 0.0;
+  tf->transform.rotation.y = 0.0;
+  tf->transform.rotation.z = 0.0;
   tf->transform.rotation.w = 1.0;
 
   simulated_x_m = 0.0;
@@ -397,7 +379,7 @@ static void odom_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
   }
 
   uint32_t now_tick = osKernelGetTickCount();
-  double dt = (double) ODOM_TIMER_PERIOD_MS / 1000.0;
+  double dt = (double) ODOM_TIMER_PERIOD_MS / APP_MILLISECONDS_PER_SECOND;
 
   if (odom_last_tick != 0U)
   {
@@ -411,38 +393,38 @@ static void odom_timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 
   odom_msg.header.stamp = stamp;
   odom_msg.pose.pose.position.x = simulated_x_m;
-  odom_msg.pose.pose.position.y = 0.0;
-  odom_msg.pose.pose.position.z = 0.0;
-  odom_msg.pose.pose.orientation.x = 0.0;
-  odom_msg.pose.pose.orientation.y = 0.0;
-  odom_msg.pose.pose.orientation.z = 0.0;
-  odom_msg.pose.pose.orientation.w = 1.0;
-  odom_msg.twist.twist.linear.x = ODOM_LINEAR_X_MPS;
-  odom_msg.twist.twist.linear.y = 0.0;
-  odom_msg.twist.twist.linear.z = 0.0;
-  odom_msg.twist.twist.angular.x = 0.0;
-  odom_msg.twist.twist.angular.y = 0.0;
-  odom_msg.twist.twist.angular.z = 0.0;
 
   geometry_msgs__msg__TransformStamped * tf = &tf_msg.transforms.data[0];
   tf->header.stamp = stamp;
   tf->transform.translation.x = simulated_x_m;
-  tf->transform.translation.y = 0.0;
-  tf->transform.translation.z = 0.0;
-  tf->transform.rotation.x = 0.0;
-  tf->transform.rotation.y = 0.0;
-  tf->transform.rotation.z = 0.0;
-  tf->transform.rotation.w = 1.0;
 
-  if (rcl_publish(&odom_publisher, &odom_msg, NULL) != RCL_RET_OK)
+  (void) publish_message(&odom_publisher, &odom_msg);
+  (void) publish_message(&tf_publisher, &tf_msg);
+}
+
+static void stop_task_forever(void)
+{
+  for (;;)
   {
-    rcl_reset_error();
+    osDelay(APP_ERROR_DELAY_MS);
+  }
+}
+
+static void retry_after_rcl_error(void)
+{
+  rcl_reset_error();
+  osDelay(RCL_RETRY_DELAY_MS);
+}
+
+static bool publish_message(rcl_publisher_t * publisher, const void * message)
+{
+  if (rcl_publish(publisher, message, NULL) == RCL_RET_OK)
+  {
+    return true;
   }
 
-  if (rcl_publish(&tf_publisher, &tf_msg, NULL) != RCL_RET_OK)
-  {
-    rcl_reset_error();
-  }
+  rcl_reset_error();
+  return false;
 }
 
 /* USER CODE END Application */
